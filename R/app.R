@@ -3,288 +3,545 @@ library(readxl)
 library(dr4pl)
 library(shiny)
 
+# ===========================================
+# UI 
+# ===========================================
 
 ui <- fluidPage(
   titlePanel("Elisa data plot and extrapolation"),
   sidebarLayout(
         # File load
         sidebarPanel(
-          fileInput("file1", "Choose xlsx file", accept = ".xlsx"),
+          fileInput("file1",
+                    "Choose xlsx file",
+                    accept = ".xlsx"),
           
         # Cell ranges
-          textInput(inputId = "measurement", 
-                    placeholder = "e.g. A1:B2",
-                    label = "Cell range of measurements"),
+          textInput("measurement", 
+                    label = "Cell range of measurements",
+                    placeholder = "e.g. A1:F97"),
         
-          textInput(inputId = "metadata", 
-                    placeholder = "e.g. A1:B2",
-                    label = "Cell range of sample data"),
+          textInput("metadata", 
+                    label = "Cell range of sample data",
+                    placeholder = "e.g. H1:I20"),
         
         #Sheet name:
           textInput(inputId = "sheetname", 
-                    placeholder = "e.g. Result summary",
-                    label = "Sheetname with elisa summary data"),
+                    label = "Sheetname with ELISA summary data",
+                    placeholder = "e.g. Result summary"),
         
         # Slider to set extrapolation factor
-          sliderInput("extrapolation", label = "Extrapolation factor",
-                      min = 0, max = 0.5, value = 0.1) 
-          ),
-        
-        # Tab to go to calculated values
+          sliderInput("extrapolation", 
+                      label = "Extrapolation factor",
+                      min = 0,
+                      max = 0.5, 
+                      value = 0.1,
+                      step = 0.01),
         
         # Button to export csv with calculated values.
-    
-        mainPanel(tableOutput("table_standard"),
-                  plotOutput("standard_curve"),
-                  verbatimTextOutput("model"),
-                  tableOutput("table_calculated"))
-  ),
-)
-
+          downloadButton("export_csv", 
+                         label = "Export calculated data as CSV")
+          ),
+        
   
-server <- function(input, output) {
-  #Helper function/calculating function
-  get_concentration <- function(standard, y, lower, upper, ic50, slope, extrapolation){
+        # Implementation of tabs for all data
+        mainPanel(tabsetPanel(
+                    tabPanel(
+                      "Standard data",
+                      h4("Raw input data"),
+                      tableOutput("table_raw"),
+                      
+                      h4("table_metadata"),
+                      tableOutput("table_metadata"),
+                      
+                      h4("Matched standard data"),
+                      tableOutput("table_standard")
+                    ),
+                    
+                    tabPanel(
+                      "Standard curve",
+                      plotOutput("standard_curve"),
+                      br(),
+                      h4("Model parameters"),
+                      verbatimTextOutput("model")
+                      ),
+                    
+                    tabPanel(
+                      "Calculated values",
+                      tableOutput("table_calculated")
+                  )
+                )
+              )
+        )
+  )
+
+
+# ========================================================================
+# Server
+# ========================================================================
+
+server <- function(input, output, session) {
+  ############################################
+  # Helper functions
+  ############################################
+  
+  invert_4pl <- function(y, lower, upper, ic50, slope){
     
-    ymin <- min(standard$basic_calculation)
-    ymax <- max(standard$basic_calculation)
+    value <- ((lower - upper) / (y - upper)) - 1
     
-    mean_abs <- standard %>% group_by(concentration) %>%
-      summarise(mean = mean(basic_calculation), .groups = "drop")
-    
-    min_factor <- mean_abs %>%
-      slice_min(concentration, n = 2) %>% summarise(mean_diff = mean[[2]]- mean[[1]]) %>% 
-      pull(mean_diff)
-    
-    max_factor <- standard %>% group_by(concentration) %>%
-      summarise(mean = mean(basic_calculation), .groups = "drop") %>%
-      slice_max(concentration, n = 2) %>% summarise(mean_diff = mean[[1]]- mean[[2]]) %>% 
-      pull(mean_diff)
-    
-    upper_limit <- ymax + (extrapolation * max_factor)
-    lower_limit <- ymin - (extrapolation * min_factor)
-    
-    if(ymin <= y && y <= ymax){
-      
-      x = ic50 * ((((lower - upper) / (y - upper)) - 1)^(1/slope)) 
-      return(x)
+    if(!is.finite(value) || value <= 0) {
+      return(NA_real_)
     }
     
-    if(y > ymax && y <= upper_limit){
-      
-      pts <- mean_abs %>% arrange(desc(concentration)) %>% 
-        slice_head(n = 2)
-      
-      fit <- lm(mean ~ concentration, data = pts)
-      coef <- coef(fit)
-      
-      return((y- coef[1])/ coef[2])
-    }
+    ic50 * value^(1/slope)
+  }
+  
+  ###########################################
+  # READ RAW DATA
+  ###########################################
+  
+  raw_data <- reactive({
+    req(
+      input$file1,
+      input$measurement,
+      input$sheetname
+    )
     
-    if(y < ymin && y >= lower_limit){
+    validate(
+      need(input$measurement != "",
+           "Please enter the measurement range"),
+      need(input$sheetname != "", 
+           "Please enter the sheet name")
+    )
+    
+    read_xlsx(input$file1$datapath,
+              range = input$measurement,
+              sheet = input$sheetname,
+              col_names = c("well", "group", "sample", 
+                            "absorbance450", "absorbande650",
+                            "basic_calculation")
+    )
+  })
+  
+  ###########################################
+  # READ CONCENTRATION METADATA
+  ###########################################
+  
+  concentration_data <- reactive({
+    req(input$file1,
+        input$metadata,
+        input$sheetname)
+    
+    validate(
+      need(
+        input$metadata != "",
+        "Please enter the metadata range"
+      )
+    )
+    
+    read_xlsx(
+      input$file1$datapath,
+      range = input$metadata,
+      sheet = input$sheetname,
+      col_names = c("sample", 
+                    "concentration")
+    ) %>% 
+      mutate(concentration = suppressWarnings(as.numeric(concentration)))
+  })
+  
+  ###########################################
+  # STANDARD DATA
+  ###########################################
+  
+  standard_data <- reactive({
+    standards <- raw_data() %>% 
+      filter(str_detect(sample, "Std")) %>% 
+      left_join(
+        concentration_data(),
+        by = "sample"
+      ) %>% 
+      drop_na(concentration, basic_calculation)
+    
+    validate(
+      need(nrow(standards) > 0,
+           "No valid standard data found")
+    )
+    
+    standards
+  })
+  
+  ###########################################
+  # STANDARD MEANS
+  ###########################################
+  
+  standard_means <- reactive({
+    
+  standard_data() %>% 
+      group_by(concentration) %>% 
+      summarise(mean = mean(basic_calculation),
+                .groups = "drop") %>% 
+      arrange(concentration)
+  })
+  
+  ###########################################
+  # FIT 4PL MODEL
+  ###########################################
+  
+  model <- reactive({
+    df <- standard_data()
+    
+    validate(
+      need(
+        n_distinct(df$concentration) >= 4,
+        "At least four different standard concentrations are recommended"
+      )
+    )
+    
+    dr4pl(
+      basic_calculation ~ concentration,
+      data = df,
+      method.init = "logistic"
+    )
+  })
+  
+  ###########################################
+  # MODEL PARAMETERS
+  ###########################################
+  
+  model_parameters <- reactive({
+    params <- model()$parameters
+    
+    list(upper = params[1],
+         ic50 = params [2],
+         slope = params[3],
+         lower = params[4])
+  })
+  
+  ###########################################
+  # EXTRAPOLATION MODELS
+  ###########################################
+ 
+   extrapolation_models <- reactive({
+    means <- standard_means()
+    
+    validate(
+      need(nrow(means) >= 2,
+           "At least two standard concentrations are required")
+    )
+    
+    lowest_points <- means %>% 
+      slice_head(n = 2)
+    
+    highest_points <- means %>% 
+      slice_tail(n = 2)
+    
+    list(
+      lowest_concentration_model = 
+        lm(mean ~ concentration, data = lowest_points),
       
-      pts <- mean_abs %>% arrange(desc(concentration)) %>% 
-        slice_tail(n = 2)
+      highest_concentration_model =
+        lm(mean ~ concentration, data = highest_points),
       
-      fit <- lm(mean ~ concentration, data = pts)
+      lowest_points = lowest_points,
+      highest_points = highest_points
+    )
+  })
+  
+  ###########################################
+  # EXTRAPOLATION LIMITS
+  ###########################################
+   
+  extrapolation_limits <- reactive({
+    
+    means <- standard_means()
+    
+    extrap_models <- extrapolation_models()
+    
+    ymin <- min(means$mean)
+    ymax <- max(means$mean)
+    
+    # Difference between the two lowest concentrations
+    low_diff <- abs(diff(extrap_models$lowest_points$mean))
+    
+    # Difference between the two highest concentrations
+    high_diff <- abs(diff(extrap_models$highest_points$mean))
+    
+    list(
+      ymin = ymin,
+      ymax = ymax,
       
-      coef <- coef(fit)
-      
-      return((y- coef[1])/ coef[2])
-      
-    }
-    return(NA_real_)}
-     
-  #Background calculations
-      # Read in data and filter down to standard data
-        standard_data <- reactive({
-          req(input$file1,
-              input$measurement, 
-              input$metadata,
-              input$sheetname)
-          
-          file <- input$file1$datapath
-          
-          data <- read_xlsx(file,
-                            range = input$measurement,
-                            sheet = input$sheetname,
-                            col_names = c("well", "group", "sample",
-                                          "absorbance_450", "absorbance650",
-                                          "basic_calculation"))
-          
-          concentration <- read_xlsx(file,
-                                     range = input$metadata,
-                                     sheet = input$sheetname,
-                                     col_names = c("sample", "concentration"))
-          
-          data %>% filter(str_detect(sample, "Std")) %>% 
-            left_join(concentration, by = "sample") %>% 
-            drop_na() %>% mutate(concentration = as.numeric(concentration))
-          })
-        # DR4PL model from standarad data
-        model <- reactive({
-          df <- standard_data()
-          model <- dr4pl(
-            basic_calculation ~ concentration,
-            data= df,
-            method.init = "logistic")
-        })
+      lower_limit = ymin - input$extrapolation * low_diff,
+      upper_limit = ymax + input$extrapolation * high_diff
+    )
+  })
+  
+  ###########################################
+  # CALCULATE CONCENTRATIONS
+  ###########################################
+  calculated_data <- reactive({
+    df <- raw_data()
+    
+    params <- model_parameters()
+    
+    limits <- extrapolation_limits()
+    
+    extrap_models <- extrapolation_models()
+    
+    # Empty vector
+    result <- df %>% 
+      mutate(calculated = NA_real_,
+             model = "Out of range")
+    
+    # Standard curve values
+    standard_curve_rows <-
+      result$basic_calculation >= limits$ymin &
+      result$basic_calculation <= limits$ymax
+    
+    result$calculated[standard_curve_rows] <-
+      vapply(
+        result$basic_calculation[standard_curve_rows],
         
-        # read in raw values again:
-        raw_data <- reactive({
-          req(input$file1,
-              input$measurement,
-              input$sheetname)
-          
-          
-          read_xlsx(input$file1$datapath,
-                    range = input$measurement,
-                    sheet = input$sheetname,
-                    col_names = c("well", "group", "sample",
-                                  "absorbance_450", "absorbance650",
-                                  "basic_calculation"))
-        })
-        # Calculated values
-        calculated_data <- reactive({
-      df <- raw_data()
-      standard <- standard_data()
-      fit <- model()
-      lower <- fit$parameters[4]
-      upper <- fit$parameters[1]
-      ic50 <- fit$parameters[2]
-      slope <- fit$parameters[3]
-      
-      
-     
-      
+        invert_4pl,
         
-    result <- df %>% rowwise() %>% 
-      mutate(calculated = get_concentration(standard, basic_calculation,
-                                            lower = lower, upper = upper,
-                                            ic50 = ic50, slope = slope, extrapolation = input$extrapolation)) %>% 
-          ungroup() %>% mutate(model = case_when(basic_calculation >= min(standard$basic_calculation) &
-                                                   basic_calculation <= max(standard$basic_calculation) ~ "standard curve",
-                                                 is.na(calculated) ~ "out of range",
-                                                 TRUE ~ "linearly extrapolated"))
-    return((result))
+        numeric(1),
+        
+        lower = params$lower,
+        upper = params$upper,
+        ic50 = params$ic50,
+        slope = params$slope
+      )
     
+    result$model[standard_curve_rows] <- "Standard curve"
+    
+    # High extrapolation
+    
+    high_rows <- 
+      result$basic_calculation > limits$ymax &
+      result$basic_calculation <= limits$upper_limit
+    
+    high_coef <- coef(extrap_models$highest_concentration_model)
+    
+    if(any(high_rows)) {
+      
+      result$calculated[high_rows] <- 
+        (result$basic_calculation[high_rows] -
+            high_coef[1]) / high_coef[2]
+      
+    result$model[high_rows] <-
+      "Linearly extrapolated"
+    }
+    
+    
+    # Low extrapolation
+    low_rows <-
+      result$basic_calculation < limits$ymin &
+      result$basic_calculation >= limits$lower_limit
+    
+    low_coef <- coef(extrap_models$lowest_concentration_model)
+    
+    if(any(low_rows)) {
+      result$calculated[low_rows] <- 
+        (result$basic_calculation[low_rows] -
+            low_coef[1]) / low_coef[2]
+      
+      result$model[low_rows] <-
+        "Linearly extrapolated"
+    }
+    
+    result <- result %>% 
+      mutate(calculated = if_else(calculated > 0,
+                                  calculated, NA_real_),
+             model = if_else(is.na(calculated), 
+                             "Out of range", model)
+             )
+    
+    result
     })
-        
-        #
-        calc_limits <- reactive({
-          calc <- calculated_data() %>%
-            filter(!is.na(calculated))
-          req(nrow(calc) > 0)
-          list(
-            xmin = min(calc$calculated),
-            xmax = max(calc$calculated))})
-        
-        # Linear rendered points for the plot
-        get_linear_line_log10space <- function(standard, xmin, xmax, direction){
-          
-          mean_abs <- standard %>% group_by(concentration) %>% 
-            summarise(mean = mean(basic_calculation), .groups = "drop")
-          
-        if(direction == "low"){
-          pts <- mean_abs %>% arrange(desc(concentration)) %>% 
-            slice_tail(n = 2)
-          
-          fit <- lm(mean ~ concentration, data = pts)
-        
-          linedata <- tibble(concentration = 10^seq(
-            log10(xmin),
-            log10(max(pts$concentration)),
-            length.out = 100))
-          
-          linedata$mean <- predict(fit, newdata = linedata)
-          
-          return(linedata)
-          
-          } else{
-          pts <- mean_abs %>% arrange(desc(concentration)) %>% 
-            slice_head(n = 2)
-          
-          fit <- lm(mean ~ concentration, data = pts)
-          
-          linedata <- tibble(concentration = 10^seq(
-            log10(min(pts$concentration)),
-            log10(xmax),
-            length.out = 100))
-          
-          linedata$mean <- predict(fit, newdata = linedata)
-          
-          return(linedata)
-          }
-        }
-        
-      lowline <- reactive({
-        limits <- calc_limits()
-        
-        get_linear_line_log10space(standard = standard_data(),
-                                    xmin = limits$xmin,
-                                    xmax = limits$xmax,
-                                    direction = "low")})
+  
+  ###########################################
+  # CALCULATED CONCENTRATION LIMITS FOR PLOT
+  ###########################################
+  
+  calc_limits <- reactive({
+    calc <- calculated_data() %>% 
+      filter(!is.na(calculated),
+             calculated > 0)
+    
+    req(nrow(calc) > 0)
+    
+    list(xmin = min(calc$calculated),
+         xmax = max(calc$calculated))
+  })
+  
+  ###########################################
+  # CREATE EXTRAPOLATION LINES FOR PLOT
+  ###########################################
+
+  extrapolation_lines <- reactive({
+    limits <- calc_limits()
+    
+    models <- extrapolation_models()
+    
+    low_points <- models$lowest_points
+    high_points <- models$highest_points
+    
+    # Low concentration line
+    low_line <- NULL
+    
+    if(limits$xmin < min(low_points$concentration)) {
       
-      highline <- reactive({
-        limits <- calc_limits()
-        
-        get_linear_line_log10space(standard = standard_data(),
-                                    xmin = limits$xmin,
-                                    xmax = limits$xmax,
-                                    direction = "high")})
+      low_x <- 10^seq(
+        log10(limits$xmin),
+        log10(min(low_points$concentration)),
+        length.out = 100
+      )
       
-  #Rendered output
-        
+      low_line <- tibble(
+        concentration = low_x,
+        mean = predict(
+          models$lowest_concentration_model, 
+          newdata = tibble(
+            concentration = low_x
+          )
+        )
+      )
+    }
+    
+    # High concentration line
+    high_line <- NULL
+    
+    if(limits$xmax > max(high_points$concentration)) {
+      high_x <- 10^seq(
+        log10(max(high_points$concentration)),
+        log10(limits$xmax),
+        length.out = 100
+      )
+      
+      high_line <- tibble(
+        concentration = high_x,
+        mean = predict(
+          models$highest_concentration_model,
+          newdata = tibble(
+            concentration = high_x
+          )
+        )
+      )
+    }
+    
+    list(low = low_line,
+         high = high_line)
+  })
+  
+  
+  ###########################################
+  # OUTPUT: STANDARD TABLE
+  ###########################################
+  
+  output$table_standard <- renderTable({
+    standard_data()
+    
+  })
+  
+  ###########################################
+  # OUTPUT: STANDARD CURVE
+  ###########################################
+  
+  output$standard_curve <- renderPlot({
+    fit <- model()
+    calculated <- calculated_data()
+    lines <- extrapolation_lines()
+    
+    plot <- fit$data %>% 
+      ggplot(aes(x = Dose, y = Response)) +
+        geom_point(size = 4, shape = 21, fill = "dodgerblue")
+    
+    
+    if(!is.null(lines$low)) {
+      
+      plot <- plot +
+        geom_line(
+          data = lines$low,
+          aes(x = concentration, y = mean), inherit.aes = FALSE
+        )
+    }
+    
+    if(!is.null(lines$high)) {
+      
+      plot <- plot +
+        geom_line(
+          data = lines$high,
+          aes(x = concentration, y = mean), inherit.aes = FALSE
+        )
+    }
+    
+    plot +
+      geom_point(
+        data = calculated %>% filter(model %in% c("Linearly extrapolated",
+                                                  "Standard curve")),
+        aes(x = calculated, y = basic_calculation, fill = "model"),
+        size = 3, shape = 21) +
+      scale_x_log10() +
+      labs(x = "Concentration", y = "Absorbance", fill = NULL) + 
+      theme_classic()+
+      theme(legend.position = "bottom",
+            axis.title = element_text(size = 15),
+            legend.text = element_text(size = 12)
+      )
+  })
+  
+  ###########################################
+  # OUTPUT: MODEL PARAMETERS
+  ###########################################
+  
+  output$model <- renderPrint({
+    model()$parameters
+  })
+  
+  ###########################################
+  # OUTPUT: CALCULATED TABLE
+  ###########################################
+  
+  output$table_calculated  <- renderTable({
+    calculated_data()
+  })
+  
+  ###########################################
+  # DOWNLOAD CSV
+  ###########################################
+  
+  output$export_csv <- downloadHandler(
+    filename = function() {
+      paste0("ELISA_extrapolated_values_",
+             Sys.Date(),
+             ".csv")
+    },
+    
+    content = function(file) {
+      write_csv(
+        calculated_data(),
+        file
+      )
+    }
+    
+  )
+  
+  # added diagnostic inputs
+  output$table_raw <- renderTable({
+    raw_data()
+  })
+  
+  output$table_metadata <- renderTable({
+    concentration_data()
+  })
+  
   output$table_standard <- renderTable({
     standard_data()
   })
-    
-    output$standard_curve <- renderPlot({
-    fit <- model()
-    lower <- fit$parameters[4]
-    upper <- fit$parameters[1]
-    ic50 <- fit$parameters[2]
-    slope <- fit$parameters[3]
-    
-    calculated <- calculated_data()
-    
-    
-    fit$data %>% ggplot(aes(x = Dose, y = Response)) + 
-      geom_point(size = 5, shape = 21, fill = "dodgerblue") + 
-      geom_smooth(method = "nls", se = FALSE, span = 0.2,
-                  formula = y ~ lower + (upper-lower)/(1+(ic50/(x^10))^slope),
-                  method.args = list(start = list(lower = lower, 
-                                                  upper = upper,
-                                                  ic50 = ic50,
-                                                  slope = slope)),
-                  fullrange = TRUE)+
-      geom_line(data = lowline(), aes(concentration, mean), inherit.aes = FALSE)+
-      geom_line(data = highline(), aes(concentration, mean), inherit.aes = FALSE)+
-      geom_point(data = calculated %>% filter(model %in% c("linearly extrapolated",
-                                                                "standard curve")), 
-                 aes(x = calculated, y = basic_calculation, fill = model), size = 3, shape = 21)+
-      scale_x_log10(guide = guide_axis_logticks(short = 1, mid = 1.5, long = 2))+
-      coord_cartesian()+
-      labs(x = "Concentration", y = "Absorbance", fill = NULL)+
-      theme_classic()+
-      theme(
-        legend.position = "bottom",
-        axis.title = element_text(size = 15),
-        legend.text = element_text(size = 12),
-        legend.key.size = unit(5, "pt"))
-    })
   
-  output$model <- renderPrint({
-    
-    df <- model()
-    
-    df$parameters
-    
-  })
   
-  output$table_calculated <- renderTable({
-    calculated_data()
-  })
+  ###########################################
+  # RUN APP
+  ###########################################
 }
 
 
